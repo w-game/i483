@@ -74,12 +74,14 @@ public class DataStreamJob {
 
     public static void buildPipeline(StreamExecutionEnvironment env) throws Exception {
         KafkaSource<String> ks = KafkaSource.<String>builder()
-                .setBootstrapServers("150.65.230.59:9092")
-                .setTopicPattern(java.util.regex.Pattern.compile("i483-sensors-s2410083-(?!analytics-).*"))
-                .setDeserializer(new ConsumerRecordDeserializer())
-                .setStartingOffsets(OffsetsInitializer.latest())
-                .setProperty("properties.metadata.max.age.ms", "5000")
-                .build();
+            .setBootstrapServers("150.65.230.59:9092")
+            .setTopicPattern(java.util.regex.Pattern.compile("i483-allsensors"))
+            // .setTopicPattern(java.util.regex.Pattern.compile("i483-sensors-s2410083-(?!analytics-).*"))
+            // .setTopics("i483-allsensors")
+            .setDeserializer(new ConsumerRecordDeserializer())
+            .setStartingOffsets(OffsetsInitializer.latest())
+            .setProperty("properties.metadata.max.age.ms", "5000")
+            .build();
 
         SingleOutputStreamOperator<String> analyticsStream = env.fromSource(
                 ks,
@@ -115,14 +117,16 @@ public class DataStreamJob {
                             sum += v;
                             min = Math.min(min, v);
                             max = Math.max(max, v);
+
+                            System.out.println("[DEBUG] Processing element: " + e);
                         }
-                        System.out.println("🔥 Window Triggered: key=" + key + ", count=" + count);
+                        System.out.println("Window Triggered: key=" + key + ", count=" + count);
                         double avg = sum / count;
                         long windowEnd = ctx.window().getEnd();
                         String sid = "s2410083";
                         String[] parts = key.split("-");
                         String sensor = parts[0], dataType = parts[1];
-                        // Emit avg, min, max to Kafka
+
                         out.collect(String.format("i483-sensors-%s-analytics-%s_%s_avg-%s_new,%d,%.2f",
                             sid, sid, sensor, dataType, windowEnd, avg));
                         out.collect(String.format("i483-sensors-%s-analytics-%s_%s_min-%s_new,%d,%.2f",
@@ -134,7 +138,6 @@ public class DataStreamJob {
 
         String sid = "s2410083";
 
-        // Stream of avg records
         DataStream<String> avgStream = analyticsStream
             .filter(s -> s.contains("_avg-"));
         avgStream.sinkTo(
@@ -143,7 +146,6 @@ public class DataStreamJob {
                 .setRecordSerializer(
                     KafkaRecordSerializationSchema.builder()
                         .setTopicSelector((String element) -> {
-                            // element is the CSV: key,timestamp,value
                             System.out.println("[DEBUG] avgStream element: " + element.split(",", 3)[0]);
                             return element.split(",", 3)[0].toString();
                         })
@@ -152,7 +154,6 @@ public class DataStreamJob {
                             public void open(InitializationContext context) {}
                             @Override
                             public byte[] serialize(String element) {
-                                // element is "key,timestamp,value"
                                 String[] parts = element.split(",", 3);
                                 return parts[2].getBytes(StandardCharsets.UTF_8);
                             }
@@ -161,7 +162,6 @@ public class DataStreamJob {
                 )
                 .build());
 
-        // Stream of min records
         DataStream<String> minStream = analyticsStream
             .filter(s -> s.contains("_min-"));
         minStream.sinkTo(
@@ -170,7 +170,6 @@ public class DataStreamJob {
                 .setRecordSerializer(
                     KafkaRecordSerializationSchema.builder()
                         .setTopicSelector((String element) -> {
-                            // element is the CSV: key,timestamp,value
                                 System.out.println("[DEBUG] minStream element: " + element.split(",", 3)[0]);
                             return element.split(",", 3)[0].toString();
                         })
@@ -179,7 +178,6 @@ public class DataStreamJob {
                             public void open(InitializationContext context) {}
                             @Override
                             public byte[] serialize(String element) {
-                                // element is "key,timestamp,value"
                                 String[] parts = element.split(",", 3);
                                 return parts[2].getBytes(StandardCharsets.UTF_8);
                             }
@@ -188,7 +186,6 @@ public class DataStreamJob {
                 )
                 .build());
 
-        // Stream of max records
         DataStream<String> maxStream = analyticsStream
             .filter(s -> s.contains("_max-"));
         maxStream.sinkTo(
@@ -197,7 +194,6 @@ public class DataStreamJob {
                 .setRecordSerializer(
                     KafkaRecordSerializationSchema.builder()
                         .setTopicSelector((String element) -> {
-                            // element is the CSV: key,timestamp,value
                             return element.split(",", 3)[0].toString();
                         })
                         .setValueSerializationSchema(new SerializationSchema<String>() {
@@ -205,7 +201,6 @@ public class DataStreamJob {
                             public void open(InitializationContext context) {}
                             @Override
                             public byte[] serialize(String element) {
-                                // element is "key,timestamp,value"
                                 String[] parts = element.split(",", 3);
                                 return parts[2].getBytes(StandardCharsets.UTF_8);
                             }
@@ -214,8 +209,6 @@ public class DataStreamJob {
                 )
                 .build());
 
-        // === CEP: room occupancy detection ===
-        // Key the original parsed stream by studentId
         DataStream<Tuple5<String, String, String, Long, Double>> parsedStream =
             env.fromSource(ks,
                 WatermarkStrategy.<String>forMonotonousTimestamps()
@@ -254,7 +247,6 @@ public class DataStreamJob {
                 }
             });
 
-        // Print or sink alerts
         alerts.print().name("CEP-Alerts");
 
         env.execute("Flink Java Job Template");
@@ -278,70 +270,10 @@ public class DataStreamJob {
     }
 }
 
-class MinMaxAvgAggregate implements AggregateFunction<
-Tuple5<String, String, String, Long, Double>,
-double[], // accumulator: [sum, count, min, max]
-double[]> {
-
-public double[] createAccumulator() {
-        return new double[] {0.0, 0.0, Double.MAX_VALUE, Double.MIN_VALUE};
-}
-
-public double[] add(Tuple5<String, String, String, Long, Double> value, double[] acc) {
-        acc[0] += value.f4;
-        acc[1] += 1;
-        acc[2] = Math.min(acc[2], value.f4);
-        acc[3] = Math.max(acc[3], value.f4);
-        return acc;
-}
-
-public double[] getResult(double[] acc) {
-        return acc;
-}
-
-public double[] merge(double[] a, double[] b) {
-        return new double[] {
-        a[0] + b[0],
-        a[1] + b[1],
-        Math.min(a[2], b[2]),
-        Math.max(a[3], b[3])
-        };
-}
-}
-
-class TopicResultWindowFunction extends ProcessWindowFunction<
-double[],
-String,
-String,
-TimeWindow> {
-
-@Override
-public void process(String key, Context ctx, Iterable<double[]> values, Collector<String> out) {
-      int count = 0;
-      for (double[] v : values) count++;
-      System.out.println(String.format("[Window Triggered] key=%s, value count=%d", key, count));
-      double[] result = values.iterator().next();
-        double avg = result[0] / result[1];
-        double min = result[2];
-        double max = result[3];
-        long timestamp = ctx.window().getEnd();
-
-        String[] parts = key.split("-");
-        String sensor = parts[0];
-        String dataType = parts[1];
-        String sid = "s2410083";
-
-        System.out.println(String.format("Processing key: %s, avg: %.2f, min: %.2f, max: %.2f", key, avg, min, max));
-
-        out.collect(String.format("i483-sensors-%s-analytics-%s-%s-avg-%s,%d,%.2f", sid, sid, sensor, dataType, timestamp, avg));
-        out.collect(String.format("i483-sensors-%s-analytics-%s-%s-min-%s,%d,%.2f", sid, sid, sensor, dataType, timestamp, min));
-        out.collect(String.format("i483-sensors-%s-analytics-%s-%s-max-%s,%d,%.2f", sid, sid, sensor, dataType, timestamp, max));
-}
-}
 class SensorKeySelector implements org.apache.flink.api.java.functions.KeySelector<
             Tuple5<String, String, String, Long, Double>, String> {
-        @Override
-        public String getKey(Tuple5<String, String, String, Long, Double> value) {
-            return value.f0 + "-" + value.f1;
-        }
+    @Override
+    public String getKey(Tuple5<String, String, String, Long, Double> value) {
+        return value.f0 + "-" + value.f1;
     }
+}
